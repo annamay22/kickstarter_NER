@@ -1,0 +1,188 @@
+---
+title: "Extract the names of creators from Kickstarter project descriptions"
+author: "Anna May"
+date: "March 21, 2018"
+output:
+  html_document:
+    df_print: paged
+  html_notebook:
+    df_print: paged
+---
+
+**Warning! Don't import the libary tidyverse, it will overwrite a function in openNLP and it will stop working!**
+```{r setup, silent = T}
+setwd("~/Dropbox/CEU_2nd_year/thesis/thesis_code/R")
+#openNLP
+#install.packages("NLP")
+#install.packages("openNLP")
+#install.packages("openNLPmodels.en",repos = "http://datacube.wu.ac.at/",type = "source")
+library(dplyr)
+library(tidytext)
+library(NLP)
+library(openNLP)
+require("NLP")
+library(skimr)
+library(stringi)
+```
+
+### 1. Import data. The *desc_first_chunk* contains the json_id, the project description and risks, the *attrs_first_chunk* contains other attributes such as project duration, goal, number of backers, etc. *old_info* contains information scraped earlier.
+```{r}
+path_to_data  <- "/home/annamay/Dropbox/CEU_2nd_year/thesis/thesis_data/parsed/"
+
+#the following lines would read all the data and bind it to a single dataframe. for now, I only use the first chunk.
+
+#all_data <- bind_rows(read.csv(paste(path_to_data,"kickstarter_desc_50000.csv",sep = ""), stringsAsFactors = F),
+#                  read.csv(paste(path_to_data,"kickstarter_desc_50000_100000.csv",sep = ""), stringsAsFactors = F),
+#                  read.csv(paste(path_to_data,"kickstarter_desc_150000.csv",sep = ""), stringsAsFactors = F))
+
+desc_first_chunk <- read.csv(paste(path_to_data,"kickstarter_desc_50000.csv",sep = ""), stringsAsFactors = F) %>% mutate(json_id = as.character(json_id))
+
+attrs_first_chunk <-  read.csv(paste(path_to_data, "kickstarter_attributes_50000.csv", sep = ""),
+                    stringsAsFactors = F) %>% mutate(json_id = as.character(json_id))
+
+old_info <- read.csv("/home/annamay/Dropbox/CEU_2nd_year/thesis/thesis_data/projects_noncorrupted.csv",
+                     stringsAsFactors = F)
+```
+
+Join the *old_info* and the *attributes* dataframe, showing what variables I have here.
+```{r}
+attrs_info_first_chunk <- attrs_first_chunk %>%
+  mutate(k_id = as.character(k_id)) %>% 
+  left_join(old_info, by = c("k_id" = "kickstarter_id")) %>%
+  mutate(goal = as.numeric(goal),
+         percentage_funded = as.numeric(percentage_funded),
+         pledged = as.numeric(pledged)) %>%
+  select(-starts_with("became_"), #remove variables that are duplicates or have a lot of missing values
+         -collected_int, -goal_int,
+         -nr_backers, -popularity_rank,
+         -rising_star_reward, -sub_category,
+         -underdog_chosen_by_user_id, - project_end)
+
+#later I have to convert everything to integer, characters are bad
+str(attrs_info_first_chunk)
+```
+
+I take a small subset of all the data to apply the name detection method on it. If I would do it on all the descriptions, the Rmarkdown notebook would compile for ages.
+```{r}
+#this is the subset I'm going to work on                  
+data <- desc_first_chunk %>%
+  filter(row_number() <= 500) %>%
+  select(-risk) #I don't need the risks part for now
+```
+
+### 2. Extracting names from the descriptions
+
+First, I create a variable indicating if the word team or crew or staff is present in the description. I will only keep these since I assume that the desciption lists the team members after a caption which is one of the words listed above. Unfortunately, this is just 102 out of the 500 descriptions.\n
+
+Next, I will split on the first occurrence of the word team|crew|staff and keep only the second part (after the word) of the description.\n
+
+The name of the resulting df is *data_splitted*.
+```{r}
+#create team boolean column
+team_df <- data %>%
+  mutate(is_team = grepl('team|crew|staff',desc)) 
+
+#how many teams do we have?
+team_df %>% group_by(is_team) %>% summarize(n = length(is_team))
+
+#initialize empty df to fill up
+data_splitted <- data.frame(json_id = character(0),
+                            first = character(0),
+                            second = character(0))
+
+#filter on the is_team col
+team_df <- team_df %>% filter(is_team == T)
+for (i in 1:dim(team_df)[1]){
+  text <- team_df$desc[i]
+  j_json_id <- team_df$json_id[i]
+  #try to split on "team"
+  split <- unlist(stri_split_fixed(text, pattern = "team", n = 2))
+  #try to split on "crew"
+  if (length(split) == 1){split <- unlist(stri_split_fixed(text, pattern = "crew",
+                                                           n = 2))}
+  #try to split on "staff"
+  if (length(split) == 1){split <- unlist(stri_split_fixed(text, pattern = "staff",
+                                                           n = 2))}
+  data_splitted <- bind_rows(data_splitted,
+                             c(json_id = j_json_id, first = split[1], second = split[2]))
+}
+```
+
+#### Now comes the fun part, I'll do Named Entity Recognition (NER). I'm using a package called openNLP which is an R wrapper to the project Apache openNLP (a machine learning model written in Java).
+
+First, I initialize annotators. The first can detect sentences, the next detects words, the last one finds named entities.
+```{r}
+sent_token_annotator <- Maxent_Sent_Token_Annotator()
+word_token_annotator <- Maxent_Word_Token_Annotator()
+entity_annotator <- Maxent_Entity_Annotator()
+```
+
+The *annotate_chunk* function tokenizes and extracts names of persons in a list, and the *annotate_chunk_debugger* is needed to catch the errors and return an NaN if something is wrong - instead of halting the whole execution.
+```{r}
+annotate_chunk <- function(s){
+  s <- as.String(s)
+  a <- annotate(s, list(sent_token_annotator,word_token_annotator))
+  annotated <- s[entity_annotator(s, a)]
+  
+  #the result of the entity_annotator function is basically a list that specified where the named entities start and end in the initial string, so I just have to apply it to the string to get out the list of named entities
+  
+  if (length(annotated) > 0){return(annotated)}
+  else{return("NaN")}
+}
+
+#this is just to handle errors
+annotate_chunk_debugger <-  function(s){
+   tryCatch(annotate_chunk(s),
+            error = function(e) {return('NaN')}) 
+}
+```
+
+### Applying it to the filtered dataframe (just to those descriptions which have a team mentioned)
+```{r, silent = T, warning = F, message = F, results = "hide"}
+tidy_ner <- data.frame(json_id = character(0), #empty df to fill up
+                       name = character(0))
+
+for (i in 1:dim(data_splitted)[1]){
+  row <-  data_splitted[i,]
+  namelist <-  annotate_chunk_debugger(row["second"])
+  for (j in namelist){
+    j_json_id <-  row["json_id"]
+    tidy_ner <- bind_rows(tidy_ner,
+                          data.frame(json_id = j_json_id, name = j))
+  }
+}
+```
+
+This is a good example what the code is capable of:
+```{r}
+#json_id = "1000011"
+
+data %>% filter(json_id == "1000011") %>% .$desc
+```
+
+Extracted names:
+```{r}
+tidy_ner %>% filter(json_id == "1000011")
+```
+
+It still requires some cleaning, but it has all the creators in there.
+
+I group the df by json_id so we can see how many descriptions contained team member names.
+```{r}
+tidy_ner %>% filter(name != "NaN") %>%
+  group_by(json_id) %>%
+  summarize(n = length(json_id)) %>%
+  arrange(-n)
+```
+
+Alltogether, I only managed to identify and extract names from 55 descriptions out of 500. That's quite a bad ratio, although I cannot be sure how many of the projects has the team members listed. Also, I applied quite a strict filtering at the beginning and kept only 100 descriptions as the input of the NER functions.\n
+It would be nice to discuss:\n
+* if I need less strict filtering
+* how to test accuracy
+* if this method is applicable at all
+
+### Saving workspace image
+```{r}
+save.image("~/Dropbox/CEU_2nd_year/thesis/thesis_code/R/.RData")
+```
+
